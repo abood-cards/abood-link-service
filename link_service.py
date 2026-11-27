@@ -14,6 +14,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = str(os.getenv("ADMIN_CHAT_ID", ""))
 MAIN_BOT_URL = os.getenv("MAIN_BOT_URL", "https://abood-trader.onrender.com").rstrip("/")
 LINK_WEBHOOK_SECRET = os.getenv("LINK_WEBHOOK_SECRET", "abood_secure_link_2026")
+PO_PROXY_URL = os.getenv("PO_PROXY_URL", "").strip()
 
 STATE = {
     "task": None,
@@ -86,6 +87,15 @@ async def send_tg_photo(http: aiohttp.ClientSession, photo_bytes: bytes, caption
         pass
 
 
+async def safe_screenshot(page) -> bytes | None:
+    if page is None or page.is_closed():
+        return None
+    try:
+        return await page.screenshot(type="png", timeout=10000, animations="disabled")
+    except Exception:
+        return None
+
+
 def cancel_active_session():
     STATE["cancel"] = True
     STATE["input_event"].set()
@@ -128,25 +138,33 @@ async def run_browser_automation(acc_name: str, login_method: str):
         try:
             await send_tg_msg(
                 http,
-                f"🌐 <b>جاري تشغيل المتصفح الآمن على Northflank لحساب ({acc_name})...</b>\n"
+                f"🌐 <b>جاري تشغيل المتصفح الآمن لحساب ({acc_name})...</b>\n"
                 f"⏳ يُرجى الانتظار بضع ثوانٍ.",
                 cancel_kb
             )
 
             pw = await async_playwright().start()
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=[
+            launch_kwargs = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--mute-audio",
                     "--disable-blink-features=AutomationControlled",
-                    "--window-size=1280,800",
+                    "--window-size=1024,700",
                 ]
-            )
+            }
+            if PO_PROXY_URL:
+                launch_kwargs["proxy"] = {"server": PO_PROXY_URL}
+
+            browser = await pw.chromium.launch(**launch_kwargs)
             context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
+                viewport={"width": 1024, "height": 700},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -175,21 +193,50 @@ async def run_browser_automation(acc_name: str, login_method: str):
             context.on("page", attach_ws)
 
             loaded_ok = False
+            cf_blocked = False
+            last_err_txt = "غير محدد"
+
             for url in ("https://pocketoption.com/en/login/", "https://po.trade/en/login/"):
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(2000)
-                    if await page.locator('input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")').count() > 0:
-                        loaded_ok = True
-                        break
-                except Exception:
+                    resp = await page.goto(url, wait_until="commit", timeout=20000)
+                    await page.wait_for_timeout(3000)
+                    title_low = (await page.title()).lower()
+                    if (resp and resp.status in (403, 503)) or "just a moment" in title_low or "attention required" in title_low:
+                        cf_blocked = True
+                        last_err_txt = f"حظر Cloudflare على IP الخادم (HTTP {resp.status if resp else '403'})"
+                        continue
+
+                    await page.wait_for_selector(
+                        'input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")',
+                        timeout=15000
+                    )
+                    loaded_ok = True
+                    break
+                except Exception as nav_e:
+                    last_err_txt = str(nav_e).splitlines()[0][:150]
                     continue
 
             if not loaded_ok:
-                shot = await page.screenshot(type="png")
-                await send_tg_photo(http, shot, "⚠️ <b>لم يظهر نموذج الدخول في الصفحة (راجع الصورة أعلاه).</b>")
+                shot = await safe_screenshot(page)
+                msg_fail = (
+                    f"⚠️ <b>تعذر فتح نموذج الدخول من السيرفر السحابي:</b>\n"
+                    f"<code>{last_err_txt}</code>\n\n"
+                    + (
+                        "🛡️ <b>السبب:</b> حماية Cloudflare تمنع عناوين IP السحابية المجانية.\n"
+                        "💡 <b>الحل:</b> أضف رابط بروكسي سكني في متغير <code>PO_PROXY_URL</code> على Railway، أو استخدم التحديث اليدوي للجلسة من البوت."
+                        if cf_blocked else
+                        "💡 <b>ملاحظة:</b> الصفحة لم تستجب في الوقت المحدد من السيرفر."
+                    )
+                )
+                if shot:
+                    await send_tg_photo(http, shot, msg_fail)
+                else:
+                    await send_tg_msg(http, msg_fail)
                 return
 
+            # ==================================================
+            # المسار 1: تسجيل الدخول عبر Google
+            # ==================================================
             if login_method == "GOOGLE":
                 clicked = False
                 popup_p = None
@@ -206,21 +253,31 @@ async def run_browser_automation(acc_name: str, login_method: str):
                         break
 
                 if not clicked:
-                    shot = await page.screenshot(type="png")
-                    await send_tg_photo(http, shot, "⚠️ تعذر العثور على زر Google في الصفحة.", cancel_kb)
+                    shot = await safe_screenshot(page)
+                    if shot:
+                        await send_tg_photo(http, shot, "⚠️ تعذر العثور على زر Google في الصفحة.", cancel_kb)
+                    else:
+                        await send_tg_msg(http, "⚠️ تعذر العثور على زر Google في الصفحة.", cancel_kb)
                     return
 
                 active_p = popup_p if popup_p else page
                 STATE["page"] = active_p
-                await active_p.wait_for_load_state("domcontentloaded", timeout=25000)
+                await active_p.wait_for_load_state("domcontentloaded", timeout=20000)
                 await active_p.wait_for_timeout(1500)
 
-                shot = await active_p.screenshot(type="png")
-                await send_tg_photo(
-                    http, shot,
-                    "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\nأرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
-                    cancel_kb
-                )
+                shot = await safe_screenshot(active_p)
+                if shot:
+                    await send_tg_photo(
+                        http, shot,
+                        "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\nأرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
+                        cancel_kb
+                    )
+                else:
+                    await send_tg_msg(
+                        http,
+                        "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\nأرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
+                        cancel_kb
+                    )
 
                 g_email = await wait_step_input("G_EMAIL")
                 if not g_email:
@@ -255,14 +312,17 @@ async def run_browser_automation(acc_name: str, login_method: str):
                     cur_p = active_p if not active_p.is_closed() else page
                     STATE["page"] = cur_p
                     if "accounts.google.com" in cur_p.url and ("challenge" in cur_p.url or "signin" in cur_p.url):
-                        shot = await cur_p.screenshot(type="png")
+                        shot = await safe_screenshot(cur_p)
                         code_inp = cur_p.locator('input[type="tel"], input[name="totpPin"], input[id*="pin"]').first
                         if await code_inp.count() > 0:
-                            await send_tg_photo(
-                                http, shot,
-                                "📲 <b>التحقق بخطوتين من Google:</b>\nأرسل الآن <b>رمز التحقق</b>:",
-                                cancel_kb
-                            )
+                            if shot:
+                                await send_tg_photo(
+                                    http, shot,
+                                    "📲 <b>التحقق بخطوتين من Google:</b>\nأرسل الآن <b>رمز التحقق</b>:",
+                                    cancel_kb
+                                )
+                            else:
+                                await send_tg_msg(http, "📲 <b>التحقق بخطوتين من Google:</b>\nأرسل الآن <b>رمز التحقق</b>:", cancel_kb)
                             otp = await wait_step_input("G_2FA")
                             if not otp:
                                 return
@@ -270,15 +330,19 @@ async def run_browser_automation(acc_name: str, login_method: str):
                             await cur_p.keyboard.press("Enter")
                             await cur_p.wait_for_timeout(3000)
                         else:
-                            await send_tg_photo(
-                                http, shot,
-                                "📱 <b>تأكيد الدخول من هاتفك:</b>\nوافق على إشعار Google في هاتفك واختر الرقم الظاهر في الصورة أعلاه.\n⏳ جاري الانتظار...",
-                                shot_kb
-                            )
+                            if shot:
+                                await send_tg_photo(
+                                    http, shot,
+                                    "📱 <b>تأكيد الدخول من هاتفك:</b>\nوافق على إشعار Google في هاتفك واختر الرقم الظاهر في الصورة أعلاه.\n⏳ جاري الانتظار...",
+                                    shot_kb
+                                )
                             await cur_p.wait_for_timeout(4500)
                     else:
                         await page.wait_for_timeout(1500)
 
+            # ==================================================
+            # المسار 2: تسجيل الدخول بالبريد الإلكتروني وكلمة المرور
+            # ==================================================
             else:
                 await send_tg_msg(
                     http,
@@ -312,12 +376,13 @@ async def run_browser_automation(acc_name: str, login_method: str):
                 await page.wait_for_timeout(3500)
 
                 if "/login" in page.url and not captured_ws["session"]:
-                    shot = await page.screenshot(type="png")
-                    await send_tg_photo(
-                        http, shot,
-                        "⏳ <b>فحص حالة الدخول...</b>\nإذا ظهر رمز تحقق 2FA أرسله هنا الآن:",
-                        shot_kb
-                    )
+                    shot = await safe_screenshot(page)
+                    if shot:
+                        await send_tg_photo(
+                            http, shot,
+                            "⏳ <b>فحص حالة الدخول...</b>\nإذا ظهر رمز تحقق 2FA أرسله هنا الآن:",
+                            shot_kb
+                        )
                     for _ in range(10):
                         if STATE["cancel"] or captured_ws["session"] or "/login" not in page.url:
                             break
@@ -379,11 +444,14 @@ async def run_browser_automation(acc_name: str, login_method: str):
                 pass
 
             if not demo_s and not live_s:
-                shot = await page.screenshot(type="png")
-                await send_tg_photo(
-                    http, shot,
-                    "⚠️ <b>تعذر استخراج الجلسة بعد محاولة الدخول:</b>\nتأكد من صحة البيانات أو التحقق الأمني ثم أعد المحاولة."
-                )
+                shot = await safe_screenshot(page)
+                if shot:
+                    await send_tg_photo(
+                        http, shot,
+                        "⚠️ <b>تعذر استخراج الجلسة بعد محاولة الدخول:</b>\nتأكد من صحة البيانات أو التحقق الأمني ثم أعد المحاولة."
+                    )
+                else:
+                    await send_tg_msg(http, "⚠️ <b>تعذر استخراج الجلسة بعد محاولة الدخول.</b>")
                 return
 
             payload = {
@@ -406,14 +474,11 @@ async def run_browser_automation(acc_name: str, login_method: str):
             pass
         except Exception as e:
             err_msg = str(e).splitlines()[0][:180] if str(e) else type(e).__name__
-            if STATE["page"] and not STATE["page"].is_closed():
-                try:
-                    shot = await STATE["page"].screenshot(type="png")
-                    await send_tg_photo(http, shot, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
-                except Exception:
-                    await send_tg_msg(http, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
+            shot = await safe_screenshot(STATE["page"])
+            if shot:
+                await send_tg_photo(http, shot, f"⚠️ <b>خطأ في متصفح الربط:</b>\n<code>{err_msg}</code>")
             else:
-                await send_tg_msg(http, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
+                await send_tg_msg(http, f"⚠️ <b>خطأ في متصفح الربط:</b>\n<code>{err_msg}</code>")
         finally:
             STATE["page"] = None
             STATE["awaiting"] = None
@@ -458,13 +523,10 @@ async def input_forward_handler(request):
         return web.json_response({"ok": True})
 
     if kind == "SHOT":
-        if STATE["page"] and not STATE["page"].is_closed():
-            try:
-                shot = await STATE["page"].screenshot(type="png")
-                async with aiohttp.ClientSession() as http:
-                    await send_tg_photo(http, shot, "📸 <b>لقطة الشاشة الحالية من المتصفح:</b>")
-            except Exception:
-                pass
+        shot = await safe_screenshot(STATE["page"])
+        if shot:
+            async with aiohttp.ClientSession() as http:
+                await send_tg_photo(http, shot, "📸 <b>لقطة الشاشة الحالية من المتصفح:</b>")
         return web.json_response({"ok": True})
 
     if kind == "TEXT" and STATE["awaiting"]:
@@ -476,7 +538,7 @@ async def input_forward_handler(request):
 
 
 async def health_handler(request):
-    return web.Response(text="Northflank Browser Link Service is Ready")
+    return web.Response(text="Browser Link Service is Ready")
 
 
 app = web.Application()
