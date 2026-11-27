@@ -1,30 +1,30 @@
 import asyncio
-import base64
 import json
 import os
 import re
 import sys
 import aiohttp
 from aiohttp import web
-
-try:
-    from playwright.async_api import async_playwright
-except ImportError:
-    async_playwright = None
+from playwright.async_api import async_playwright
 
 if sys.stdout.encoding != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-# رابط البوت الرئيسي على Render
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_CHAT_ID = str(os.getenv("ADMIN_CHAT_ID", ""))
 MAIN_BOT_URL = os.getenv("MAIN_BOT_URL", "https://abood-trader.onrender.com").rstrip("/")
-# مفتاح الأمان المشترك بين السيرفرين (يجب أن يطابق ما في Render)
 LINK_WEBHOOK_SECRET = os.getenv("LINK_WEBHOOK_SECRET", "abood_secure_link_2026")
-# اختياري: بروكسي في حال احتجت لتمرير الاتصال عبر IP محدد
-PO_PROXY_URL = os.getenv("PO_PROXY_URL", "").strip()
 
-
-def log(tag: str, msg: str):
-    print(f"[{tag}] {msg}", flush=True)
+STATE = {
+    "task": None,
+    "page": None,
+    "cancel": False,
+    "awaiting": None,
+    "input_event": asyncio.Event(),
+    "last_input": "",
+    "acc_name": "حساب جديد",
+    "method": "EMAIL"
+}
 
 
 def parse_auth_frame(frame: str) -> dict | None:
@@ -50,270 +50,179 @@ def extract_session_and_uid(html_text: str) -> tuple[str, str]:
     return (sess_m.group(1) if sess_m else ""), (uid_m.group(1) if uid_m else "")
 
 
-class RemotePlaywrightLinker:
-    def __init__(self):
-        self.task: asyncio.Task | None = None
-        self.active_page = None
-        self.input_event = asyncio.Event()
-        self.last_input = ""
-        self.cancelled = False
+async def tg_post(http: aiohttp.ClientSession, method: str, payload: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        async with http.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            return await resp.json()
+    except Exception:
+        return None
 
-    def cancel_current(self):
-        self.cancelled = True
-        self.input_event.set()
-        if self.task and not self.task.done():
-            self.task.cancel()
-        self.task = None
-        self.active_page = None
 
-    async def push_event_to_main_bot(
-        self,
-        event_type: str,
-        text: str,
-        next_state: str = "",
-        expect_password: bool = False,
-        show_controls: bool = True,
-        image_bytes: bytes | None = None
-    ):
-        payload = {
-            "event_type": event_type,
-            "text": text,
-            "next_state": next_state,
-            "expect_password": expect_password,
-            "show_controls": show_controls,
-            "image_b64": base64.b64encode(image_bytes).decode("ascii") if image_bytes else ""
-        }
-        headers = {"X-Link-Secret": LINK_WEBHOOK_SECRET}
+async def send_tg_msg(http: aiohttp.ClientSession, text: str, reply_markup: dict = None):
+    payload = {"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await tg_post(http, "sendMessage", payload)
+
+
+async def send_tg_photo(http: aiohttp.ClientSession, photo_bytes: bytes, caption: str, reply_markup: dict = None):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    form = aiohttp.FormData()
+    form.add_field("chat_id", ADMIN_CHAT_ID)
+    form.add_field("caption", caption[:1000])
+    form.add_field("parse_mode", "HTML")
+    if reply_markup:
+        form.add_field("reply_markup", json.dumps(reply_markup))
+    form.add_field("photo", photo_bytes, filename="screen.png", content_type="image/png")
+    try:
+        async with http.post(url, data=form, timeout=aiohttp.ClientTimeout(total=25)) as resp:
+            await resp.json()
+    except Exception:
+        pass
+
+
+def cancel_active_session():
+    STATE["cancel"] = True
+    STATE["input_event"].set()
+    STATE["awaiting"] = None
+    if STATE["task"] and not STATE["task"].done():
+        STATE["task"].cancel()
+    STATE["task"] = None
+    STATE["page"] = None
+
+
+async def wait_step_input(step_name: str, timeout_sec: int = 180) -> str | None:
+    STATE["input_event"].clear()
+    STATE["last_input"] = ""
+    STATE["awaiting"] = step_name
+    try:
+        await asyncio.wait_for(STATE["input_event"].wait(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        if STATE["awaiting"] == step_name:
+            STATE["awaiting"] = None
+    if STATE["cancel"]:
+        return None
+    return STATE["last_input"]
+
+
+async def run_browser_automation(acc_name: str, login_method: str):
+    STATE["cancel"] = False
+    cancel_kb = {"inline_keyboard": [[{"text": "❌ إلغاء العملية", "callback_data": "sd_cancel"}]]}
+    shot_kb = {
+        "inline_keyboard": [
+            [{"text": "📸 تحديث لقطة الشاشة", "callback_data": "sd_shot"}],
+            [{"text": "❌ إلغاء العملية", "callback_data": "sd_cancel"}]
+        ]
+    }
+
+    pw = None
+    browser = None
+    async with aiohttp.ClientSession() as http:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{MAIN_BOT_URL}/api/webhook/link_event",
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=25)
-                ) as resp:
-                    await resp.text()
-        except Exception as e:
-            log("EVENT_ERR", f"تعذر إرسال الحدث للبوت الرئيسي: {e}")
-
-    async def send_final_account_to_main_bot(self, name: str, uid: str, demo_s: str, live_s: str) -> bool:
-        payload = {
-            "name": name,
-            "uid": uid or "Unknown",
-            "demo_session": demo_s,
-            "live_session": live_s
-        }
-        headers = {"X-Link-Secret": LINK_WEBHOOK_SECRET}
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{MAIN_BOT_URL}/api/webhook/link_account",
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
-                    return resp.status == 200
-        except Exception as e:
-            log("FINAL_ERR", f"تعذر إرسال الحساب النهائي للبوت الرئيسي: {e}")
-            return False
-
-    async def wait_user_input(self, timeout_sec: int = 180) -> str | None:
-        self.input_event.clear()
-        self.last_input = ""
-        try:
-            await asyncio.wait_for(self.input_event.wait(), timeout=timeout_sec)
-        except asyncio.TimeoutError:
-            return None
-        if self.cancelled:
-            return None
-        return self.last_input
-
-    async def take_manual_screenshot(self):
-        if self.active_page and not self.active_page.is_closed():
-            try:
-                shot = await self.active_page.screenshot(type="png", timeout=10000)
-                await self.push_event_to_main_bot(
-                    "PHOTO",
-                    "📸 <b>لقطة الشاشة الحالية من المتصفح:</b>",
-                    next_state="REMOTE_INPUT",
-                    show_controls=True,
-                    image_bytes=shot
-                )
-            except Exception as e:
-                log("SHOT_ERR", f"فشل التقاط الصورة اليدوية: {e}")
-
-    async def run_login_flow(self, acc_name: str, method: str):
-        if async_playwright is None:
-            await self.push_event_to_main_bot(
-                "ERROR",
-                "⚠️ مكتبة <code>playwright</code> غير مثبتة في حاوية الاستخراج."
-            )
-            return
-
-        self.cancelled = False
-        pw = None
-        browser = None
-        try:
-            await self.push_event_to_main_bot(
-                "STATUS",
-                f"🌐 <b>جاري تشغيل المتصفح الآمن لحساب ({acc_name})...</b>\n⏳ يُرجى الانتظار بضع ثوانٍ.",
-                show_controls=False
+            await send_tg_msg(
+                http,
+                f"🌐 <b>جاري تشغيل المتصفح الآمن على Northflank لحساب ({acc_name})...</b>\n"
+                f"⏳ يُرجى الانتظار بضع ثوانٍ.",
+                cancel_kb
             )
 
             pw = await async_playwright().start()
-            launch_args = [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-software-rasterizer",
-                "--disable-background-networking",
-                "--mute-audio",
-                "--no-first-run",
-                "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=192",
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1024,720",
-            ]
-            launch_kwargs = {"headless": True, "args": launch_args}
-            if PO_PROXY_URL:
-                launch_kwargs["proxy"] = {"server": PO_PROXY_URL}
-
-            browser = await pw.chromium.launch(**launch_kwargs)
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1280,800",
+                ]
+            )
             context = await browser.new_context(
-                viewport={"width": 1024, "height": 720},
+                viewport={"width": 1280, "height": 800},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                 ),
                 locale="en-US"
             )
-            await context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-
-            async def route_filter(route):
-                r_type = route.request.resource_type
-                r_url = route.request.url.lower()
-                if r_type in ("media", "font"):
-                    await route.abort()
-                elif any(x in r_url for x in ("google-analytics", "googletagmanager", "facebook", "doubleclick", "hotjar")):
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await context.route("**/*", route_filter)
+            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
             page = await context.new_page()
-            self.active_page = page
+            STATE["page"] = page
+            captured_ws = {"session": "", "uid": ""}
 
-            captured_ws = {"demo": "", "live": "", "uid": ""}
-
-            def attach_ws_listener(target_page):
+            def attach_ws(target_p):
                 def on_ws(ws):
                     def on_frame(payload):
                         if isinstance(payload, str) and payload.startswith('42["auth",'):
                             parsed = parse_auth_frame(payload)
                             if parsed and parsed.get("session"):
-                                s_val = str(parsed["session"])
-                                if int(parsed.get("isDemo", 1)) == 0:
-                                    captured_ws["live"] = s_val
-                                else:
-                                    captured_ws["demo"] = s_val
+                                captured_ws["session"] = str(parsed["session"])
                                 if parsed.get("uid"):
                                     captured_ws["uid"] = str(parsed["uid"])
                     ws.on("framesent", on_frame)
-                target_page.on("websocket", on_ws)
+                target_p.on("websocket", on_ws)
 
-            attach_ws_listener(page)
-            context.on("page", attach_ws_listener)
+            attach_ws(page)
+            context.on("page", attach_ws)
 
-            login_urls = [
-                "https://pocketoption.com/en/login/",
-                "https://po.trade/en/login/",
-            ]
             loaded_ok = False
-            last_err = ""
-            for url in login_urls:
+            for url in ("https://pocketoption.com/en/login/", "https://po.trade/en/login/"):
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_selector(
-                        'input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")',
-                        timeout=18000
-                    )
-                    loaded_ok = True
-                    break
-                except Exception as e:
-                    last_err = str(e).splitlines()[0][:150]
+                    await page.wait_for_timeout(2000)
+                    if await page.locator('input[type="email"], input[name="email"], a[href*="google"], button:has-text("Google")').count() > 0:
+                        loaded_ok = True
+                        break
+                except Exception:
                     continue
 
             if not loaded_ok:
-                shot = None
-                try:
-                    shot = await page.screenshot(type="png", timeout=8000)
-                except Exception:
-                    pass
-                await self.push_event_to_main_bot(
-                    "PHOTO" if shot else "ERROR",
-                    f"⚠️ <b>تعذر فتح نموذج تسجيل الدخول:</b>\n<code>{last_err}</code>",
-                    image_bytes=shot
-                )
+                shot = await page.screenshot(type="png")
+                await send_tg_photo(http, shot, "⚠️ <b>لم يظهر نموذج الدخول في الصفحة (راجع الصورة أعلاه).</b>")
                 return
 
-            # ==========================================
-            # المسار أ: تسجيل الدخول عبر Google
-            # ==========================================
-            if method == "GOOGLE":
-                google_selectors = [
-                    'a[href*="google"]',
-                    'button:has-text("Google")',
-                    'a:has-text("Google")',
-                    '.social-btn--google',
-                    '[data-provider="google"]'
-                ]
-                clicked_google = False
-                popup_page = None
-
-                for sel in google_selectors:
+            if login_method == "GOOGLE":
+                clicked = False
+                popup_p = None
+                for sel in ('a[href*="google"]', 'button:has-text("Google")', 'a:has-text("Google")', '.social-btn--google'):
                     loc = page.locator(sel).first
                     if await loc.count() > 0:
                         try:
-                            async with context.expect_page(timeout=4500) as popup_info:
+                            async with context.expect_page(timeout=4000) as p_info:
                                 await loc.click(timeout=5000)
-                            popup_page = await popup_info.value
+                            popup_p = await p_info.value
                         except Exception:
-                            try:
-                                await loc.click(timeout=5000)
-                            except Exception:
-                                continue
-                        clicked_google = True
+                            await loc.click(timeout=5000)
+                        clicked = True
                         break
 
-                if not clicked_google:
+                if not clicked:
                     shot = await page.screenshot(type="png")
-                    await self.push_event_to_main_bot(
-                        "PHOTO",
-                        "⚠️ لم يظهر زر Google في الصفحة. أعد المحاولة أو استخدم البريد الإلكتروني.",
-                        image_bytes=shot
-                    )
+                    await send_tg_photo(http, shot, "⚠️ تعذر العثور على زر Google في الصفحة.", cancel_kb)
                     return
 
-                active_p = popup_page if popup_page else page
-                self.active_page = active_p
+                active_p = popup_p if popup_p else page
+                STATE["page"] = active_p
                 await active_p.wait_for_load_state("domcontentloaded", timeout=25000)
                 await active_p.wait_for_timeout(1500)
 
                 shot = await active_p.screenshot(type="png")
-                await self.push_event_to_main_bot(
-                    "PHOTO",
+                await send_tg_photo(
+                    http, shot,
                     "🔵 <b>تسجيل الدخول عبر Google — الخطوة 1:</b>\nأرسل الآن <b>بريد Gmail</b> الخاص بحسابك:",
-                    next_state="REMOTE_INPUT",
-                    show_controls=True,
-                    image_bytes=shot
+                    cancel_kb
                 )
 
-                g_email = await self.wait_user_input(timeout_sec=180)
+                g_email = await wait_step_input("G_EMAIL")
                 if not g_email:
                     return
 
@@ -324,164 +233,117 @@ class RemotePlaywrightLinker:
                 await active_p.wait_for_timeout(3000)
 
                 pass_inp = active_p.locator('input[type="password"]').first
-                if await pass_inp.count() == 0:
-                    shot = await active_p.screenshot(type="png")
-                    await self.push_event_to_main_bot(
-                        "PHOTO",
-                        "⚠️ <b>تنبيه من Google:</b>\nلم يظهر حقل كلمة المرور بعد (ربما يوجد تحقق أمني). أرسل النص المطلوب في الصورة:",
-                        next_state="REMOTE_INPUT",
-                        show_controls=True,
-                        image_bytes=shot
-                    )
-                    retry_txt = await self.wait_user_input(timeout_sec=180)
-                    if not retry_txt:
-                        return
-                    any_inp = active_p.locator("input:visible").first
-                    if await any_inp.count() > 0:
-                        await any_inp.fill(retry_txt.strip())
-                        await active_p.keyboard.press("Enter")
-                        await active_p.wait_for_timeout(3000)
-
-                pass_inp = active_p.locator('input[type="password"]').first
                 if await pass_inp.count() > 0:
-                    await self.push_event_to_main_bot(
-                        "PROMPT",
-                        "🔒 <b>تسجيل الدخول عبر Google — الخطوة 2:</b>\nأرسل الآن <b>كلمة مرور حساب Google</b> (ستُحذف رسالتك فور استلامها للحماية):",
-                        next_state="REMOTE_INPUT",
-                        expect_password=True,
-                        show_controls=False
+                    await send_tg_msg(
+                        http,
+                        "🔒 <b>تسجيل الدخول عبر Google — الخطوة 2:</b>\nأرسل الآن <b>كلمة مرور Google</b> (ستُحذف رسالتك فور استلامها):",
+                        cancel_kb
                     )
-                    g_pass = await self.wait_user_input(timeout_sec=180)
+                    g_pass = await wait_step_input("G_PASS")
                     if not g_pass:
                         return
-
                     await pass_inp.fill(g_pass)
                     await active_p.keyboard.press("Enter")
                     await active_p.wait_for_timeout(3500)
 
-                # انتظار التحقق بخطوتين (2FA / تأكيد الهاتف / رمز SMS)
-                prompt_sent = False
-                for _ in range(25):
-                    if self.cancelled or captured_ws["demo"] or captured_ws["live"]:
+                for _ in range(20):
+                    if STATE["cancel"] or captured_ws["session"]:
                         break
                     if ("pocketoption.com" in page.url or "po.trade" in page.url) and "/login" not in page.url:
                         break
 
                     cur_p = active_p if not active_p.is_closed() else page
-                    self.active_page = cur_p
-                    cur_url = cur_p.url
-
-                    if "accounts.google.com" in cur_url and ("challenge" in cur_url or "signin" in cur_url):
-                        code_inp = cur_p.locator('input[type="tel"], input[name="totpPin"], input[id*="pin"], input[type="text"]:visible').first
+                    STATE["page"] = cur_p
+                    if "accounts.google.com" in cur_p.url and ("challenge" in cur_p.url or "signin" in cur_p.url):
+                        shot = await cur_p.screenshot(type="png")
+                        code_inp = cur_p.locator('input[type="tel"], input[name="totpPin"], input[id*="pin"]').first
                         if await code_inp.count() > 0:
-                            shot = await cur_p.screenshot(type="png")
-                            await self.push_event_to_main_bot(
-                                "PHOTO",
-                                "📲 <b>التحقق بخطوتين من Google:</b>\nأرسل الآن <b>رمز التحقق</b> الظاهر في رسالتك أو تطبيق المصادقة:",
-                                next_state="REMOTE_INPUT",
-                                show_controls=True,
-                                image_bytes=shot
+                            await send_tg_photo(
+                                http, shot,
+                                "📲 <b>التحقق بخطوتين من Google:</b>\nأرسل الآن <b>رمز التحقق</b>:",
+                                cancel_kb
                             )
-                            otp_code = await self.wait_user_input(timeout_sec=180)
-                            if not otp_code:
+                            otp = await wait_step_input("G_2FA")
+                            if not otp:
                                 return
-                            await code_inp.fill(otp_code.strip())
+                            await code_inp.fill(otp.strip())
                             await cur_p.keyboard.press("Enter")
                             await cur_p.wait_for_timeout(3000)
-                            prompt_sent = False
                         else:
-                            if not prompt_sent:
-                                shot = await cur_p.screenshot(type="png")
-                                await self.push_event_to_main_bot(
-                                    "PHOTO",
-                                    "📱 <b>تأكيد الدخول من هاتفك:</b>\nافتح إشعار Google على هاتفك واضغط <b>نعم (Yes)</b> ثم اختر الرقم الظاهر في الصورة أعلاه.\n⏳ البوت ينتظر موافقتك تلقائيًا...",
-                                    next_state="REMOTE_INPUT",
-                                    show_controls=True,
-                                    image_bytes=shot
-                                )
-                                prompt_sent = True
-                            await cur_p.wait_for_timeout(3500)
+                            await send_tg_photo(
+                                http, shot,
+                                "📱 <b>تأكيد الدخول من هاتفك:</b>\nوافق على إشعار Google في هاتفك واختر الرقم الظاهر في الصورة أعلاه.\n⏳ جاري الانتظار...",
+                                shot_kb
+                            )
+                            await cur_p.wait_for_timeout(4500)
                     else:
                         await page.wait_for_timeout(1500)
 
-            # ==========================================
-            # المسار ب: تسجيل الدخول بالبريد الإلكتروني وكلمة المرور
-            # ==========================================
             else:
-                await self.push_event_to_main_bot(
-                    "PROMPT",
+                await send_tg_msg(
+                    http,
                     "📧 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 1:</b>\nأرسل الآن <b>البريد الإلكتروني</b> المسجل في Pocket Option:",
-                    next_state="REMOTE_INPUT",
-                    show_controls=False
+                    cancel_kb
                 )
-                po_email = await self.wait_user_input(timeout_sec=180)
+                po_email = await wait_step_input("PO_EMAIL")
                 if not po_email:
                     return
 
-                await self.push_event_to_main_bot(
-                    "PROMPT",
-                    "🔒 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 2:</b>\nأرسل الآن <b>كلمة المرور</b> (ستُحذف رسالتك فور استلامها للحماية):",
-                    next_state="REMOTE_INPUT",
-                    expect_password=True,
-                    show_controls=False
+                await send_tg_msg(
+                    http,
+                    "🔒 <b>تسجيل الدخول بالبريد الإلكتروني — الخطوة 2:</b>\nأرسل الآن <b>كلمة المرور</b> (ستُحذف رسالتك فور استلامها):",
+                    cancel_kb
                 )
-                po_pass = await self.wait_user_input(timeout_sec=180)
+                po_pass = await wait_step_input("PO_PASS")
                 if not po_pass:
                     return
 
-                email_field = page.locator('input[name="email"], input[type="email"]').first
-                pass_field = page.locator('input[name="password"], input[type="password"]').first
-                await email_field.wait_for(state="visible", timeout=15000)
-                await email_field.fill(po_email.strip())
-                await pass_field.fill(po_pass)
+                email_inp = page.locator('input[name="email"], input[type="email"]').first
+                pass_inp = page.locator('input[name="password"], input[type="password"]').first
+                await email_inp.wait_for(state="visible", timeout=15000)
+                await email_inp.fill(po_email.strip())
+                await pass_inp.fill(po_pass)
 
-                submit_btn = page.locator('button[type="submit"], input[type="submit"]').first
-                if await submit_btn.count() > 0:
-                    await submit_btn.click()
+                btn = page.locator('button[type="submit"], input[type="submit"]').first
+                if await btn.count() > 0:
+                    await btn.click()
                 else:
                     await page.keyboard.press("Enter")
-
                 await page.wait_for_timeout(3500)
 
-                if "/login" in page.url and not captured_ws["demo"] and not captured_ws["live"]:
+                if "/login" in page.url and not captured_ws["session"]:
                     shot = await page.screenshot(type="png")
-                    await self.push_event_to_main_bot(
-                        "PHOTO",
-                        "📲 <b>التحقق من الدخول:</b>\nإذا ظهر حقل رمز تحقق (2FA) أرسل الرمز الآن، أو انتظر لحظات لإتمام الدخول:",
-                        next_state="REMOTE_INPUT",
-                        show_controls=True,
-                        image_bytes=shot
+                    await send_tg_photo(
+                        http, shot,
+                        "⏳ <b>فحص حالة الدخول...</b>\nإذا ظهر رمز تحقق 2FA أرسله هنا الآن:",
+                        shot_kb
                     )
-                    for _ in range(12):
-                        if self.cancelled or captured_ws["demo"] or captured_ws["live"] or "/login" not in page.url:
+                    for _ in range(10):
+                        if STATE["cancel"] or captured_ws["session"] or "/login" not in page.url:
                             break
-                        if self.last_input:
-                            code_val = self.last_input.strip()
-                            self.last_input = ""
-                            inp_2fa = page.locator('input[type="text"]:visible, input[type="tel"]:visible, input[name*="code"]:visible').first
+                        otp_try = await wait_step_input("PO_2FA", timeout_sec=4)
+                        if otp_try:
+                            inp_2fa = page.locator('input:visible').first
                             if await inp_2fa.count() > 0:
-                                await inp_2fa.fill(code_val)
+                                await inp_2fa.fill(otp_try.strip())
                                 await page.keyboard.press("Enter")
-                        await page.wait_for_timeout(2000)
+                                await page.wait_for_timeout(3000)
 
-            if self.cancelled:
+            if STATE["cancel"]:
                 return
 
-            # ==========================================
-            # استخراج جلسة الديمو + الحقيقي + الآيدي وإرسالها إلى Render
-            # ==========================================
-            self.active_page = page
+            STATE["page"] = page
             await page.wait_for_timeout(2000)
-            html_content = await page.content()
-            page_sess, uid_val = extract_session_and_uid(html_content)
+            demo_s, uid_val = extract_session_and_uid(await page.content())
+            live_s = ""
 
-            demo_sess = captured_ws["demo"] or page_sess
-            live_sess = captured_ws["live"]
+            if captured_ws["session"]:
+                demo_s = demo_s or captured_ws["session"]
             if captured_ws["uid"]:
                 uid_val = uid_val or captured_ws["uid"]
 
             try:
-                both_res = await page.evaluate("""async () => {
+                res_both = await page.evaluate("""async () => {
                     let out = {demo: '', live: '', uid: ''};
                     const grab = (t) => {
                         let u = (t.match(/["']?uid["']?\\s*[:=]\\s*["']?(\\d{5,15})["']?/i) || [])[1] || '';
@@ -506,55 +368,55 @@ class RemotePlaywrightLinker:
                     } catch(e) {}
                     return out;
                 }""")
-                if isinstance(both_res, dict):
-                    if both_res.get("demo"):
-                        demo_sess = both_res["demo"]
-                    if both_res.get("live"):
-                        live_sess = both_res["live"]
-                    if both_res.get("uid") and not uid_val:
-                        uid_val = both_res["uid"]
+                if isinstance(res_both, dict):
+                    if res_both.get("demo"):
+                        demo_s = res_both["demo"]
+                    if res_both.get("live"):
+                        live_s = res_both["live"]
+                    if res_both.get("uid") and not uid_val:
+                        uid_val = res_both["uid"]
             except Exception:
                 pass
 
-            if not demo_sess and not live_sess:
+            if not demo_s and not live_s:
                 shot = await page.screenshot(type="png")
-                await self.push_event_to_main_bot(
-                    "PHOTO",
-                    "⚠️ <b>تعذر استخراج الجلسة بعد محاولة الدخول:</b>\nتأكد من صحة البيانات أو رمز التحقق ثم أعد المحاولة.",
-                    image_bytes=shot
+                await send_tg_photo(
+                    http, shot,
+                    "⚠️ <b>تعذر استخراج الجلسة بعد محاولة الدخول:</b>\nتأكد من صحة البيانات أو التحقق الأمني ثم أعد المحاولة."
                 )
                 return
 
-            sent_ok = await self.send_final_account_to_main_bot(
-                acc_name,
-                uid_val or "Unknown",
-                demo_sess or live_sess,
-                live_sess
-            )
-            if not sent_ok:
-                await self.push_event_to_main_bot(
-                    "ERROR",
-                    "⚠️ تم تسجيل الدخول بنجاح، ولكن تعذر الوصول إلى رابط البوت الرئيسي على Render لإرسال الجلسة."
-                )
+            payload = {
+                "name": acc_name,
+                "uid": uid_val or "Unknown",
+                "demo_session": demo_s or live_s,
+                "live_session": live_s
+            }
+            async with http.post(
+                f"{MAIN_BOT_URL}/api/webhook/link_account",
+                json=payload,
+                headers={"X-Link-Secret": LINK_WEBHOOK_SECRET},
+                timeout=aiohttp.ClientTimeout(total=25)
+            ) as resp:
+                if resp.status != 200:
+                    err_txt = await resp.text()
+                    await send_tg_msg(http, f"⚠️ تم استخراج الجلسة لكن رفض البوت الرئيسي استلامها: <code>{err_txt[:120]}</code>")
 
         except asyncio.CancelledError:
-            log("CANCEL", "تم إلغاء عملية الربط.")
+            pass
         except Exception as e:
             err_msg = str(e).splitlines()[0][:180] if str(e) else type(e).__name__
-            log("FLOW_ERR", f"خطأ أثناء الربط: {err_msg}")
-            shot = None
-            try:
-                if self.active_page and not self.active_page.is_closed():
-                    shot = await self.active_page.screenshot(type="png", timeout=8000)
-            except Exception:
-                pass
-            await self.push_event_to_main_bot(
-                "PHOTO" if shot else "ERROR",
-                f"⚠️ <b>حدث خطأ أثناء الاتصال بالمنصة:</b>\n<code>{err_msg}</code>",
-                image_bytes=shot
-            )
+            if STATE["page"] and not STATE["page"].is_closed():
+                try:
+                    shot = await STATE["page"].screenshot(type="png")
+                    await send_tg_photo(http, shot, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
+                except Exception:
+                    await send_tg_msg(http, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
+            else:
+                await send_tg_msg(http, f"⚠️ <b>خطأ في متصفح Northflank:</b>\n<code>{err_msg}</code>")
         finally:
-            self.active_page = None
+            STATE["page"] = None
+            STATE["awaiting"] = None
             if browser:
                 try:
                     await browser.close()
@@ -567,59 +429,61 @@ class RemotePlaywrightLinker:
                     pass
 
 
-linker = RemotePlaywrightLinker()
-
-
-def check_auth(request) -> bool:
+async def start_trigger_handler(request):
     secret = request.headers.get("X-Link-Secret", "")
-    return bool(LINK_WEBHOOK_SECRET and secret == LINK_WEBHOOK_SECRET)
+    if secret != LINK_WEBHOOK_SECRET:
+        return web.Response(text="Unauthorized", status=401)
+    data = await request.json()
+    acc_name = str(data.get("name", "حساب جديد")).strip() or "حساب جديد"
+    method = str(data.get("method", "EMAIL")).upper()
+
+    cancel_active_session()
+    STATE["acc_name"] = acc_name
+    STATE["method"] = method
+    STATE["task"] = asyncio.create_task(run_browser_automation(acc_name, method))
+    return web.json_response({"ok": True})
+
+
+async def input_forward_handler(request):
+    secret = request.headers.get("X-Link-Secret", "")
+    if secret != LINK_WEBHOOK_SECRET:
+        return web.Response(text="Unauthorized", status=401)
+    data = await request.json()
+    kind = data.get("kind", "")
+
+    if kind == "CANCEL":
+        cancel_active_session()
+        async with aiohttp.ClientSession() as http:
+            await send_tg_msg(http, "❌ تم إلغاء جلسة الربط وإغلاق المتصفح.")
+        return web.json_response({"ok": True})
+
+    if kind == "SHOT":
+        if STATE["page"] and not STATE["page"].is_closed():
+            try:
+                shot = await STATE["page"].screenshot(type="png")
+                async with aiohttp.ClientSession() as http:
+                    await send_tg_photo(http, shot, "📸 <b>لقطة الشاشة الحالية من المتصفح:</b>")
+            except Exception:
+                pass
+        return web.json_response({"ok": True})
+
+    if kind == "TEXT" and STATE["awaiting"]:
+        STATE["last_input"] = str(data.get("text", ""))
+        STATE["input_event"].set()
+        return web.json_response({"ok": True, "consumed": True})
+
+    return web.json_response({"ok": True, "consumed": False})
 
 
 async def health_handler(request):
-    return web.Response(text="Abood Playwright Link Microservice is alive!")
-
-
-async def start_session_handler(request):
-    if not check_auth(request):
-        return web.Response(text="Unauthorized", status=401)
-    data = await request.json()
-    acc_name = str(data.get("acc_name", "حساب الهاتف")).strip() or "حساب الهاتف"
-    method = str(data.get("method", "EMAIL")).strip().upper()
-    linker.cancel_current()
-    linker.task = asyncio.create_task(linker.run_login_flow(acc_name, method))
-    return web.json_response({"ok": True})
-
-
-async def input_session_handler(request):
-    if not check_auth(request):
-        return web.Response(text="Unauthorized", status=401)
-    data = await request.json()
-    linker.last_input = str(data.get("value", ""))
-    linker.input_event.set()
-    return web.json_response({"ok": True})
-
-
-async def screenshot_session_handler(request):
-    if not check_auth(request):
-        return web.Response(text="Unauthorized", status=401)
-    asyncio.create_task(linker.take_manual_screenshot())
-    return web.json_response({"ok": True})
-
-
-async def cancel_session_handler(request):
-    if not check_auth(request):
-        return web.Response(text="Unauthorized", status=401)
-    linker.cancel_current()
-    return web.json_response({"ok": True})
+    return web.Response(text="Northflank Browser Link Service is Ready")
 
 
 app = web.Application()
 app.router.add_get("/", health_handler)
 app.router.add_get("/health", health_handler)
-app.router.add_post("/api/session/start", start_session_handler)
-app.router.add_post("/api/session/input", input_session_handler)
-app.router.add_post("/api/session/screenshot", screenshot_session_handler)
-app.router.add_post("/api/session/cancel", cancel_session_handler)
+app.router.add_post("/api/start_login", start_trigger_handler)
+app.router.add_post("/api/forward_input", input_forward_handler)
 
 if __name__ == "__main__":
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
