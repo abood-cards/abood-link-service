@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.50.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
 WORKDIR /app
 ENV PORT=8080
 COPY requirements.txt .
